@@ -225,7 +225,7 @@ fn setup_flow_control(envs: &[(&str, &str)]) -> Option<FlowControlHarness> {
         cert: Some(&cert),
         keep_alive_interval: Some(0),
         envs,
-        rust_log: "info",
+        rust_log: "debug",
         capture_logs: true,
     });
     let client_logs = client_logs.expect("client logs");
