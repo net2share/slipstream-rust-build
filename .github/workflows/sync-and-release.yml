@@ -1,0 +1,218 @@
+name: Sync Upstream and Release
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Force a release even if no new commits'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: https://github.com/Mygod/slipstream-rust.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      new_commits: ${{ steps.sync.outputs.new_commits }}
+      release_tag: ${{ steps.version.outputs.tag }}
+      short_sha: ${{ steps.sync.outputs.short_sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync with upstream
+        id: sync
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream main
+
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          echo "Upstream SHA: $UPSTREAM_SHA"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "Already up to date with upstream (workflow commit is on top)"
+            echo "new_commits=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commits found in upstream, rebasing..."
+            git rebase upstream/main
+            git push --force-with-lease origin main
+            echo "new_commits=true" >> "$GITHUB_OUTPUT"
+            echo "short_sha=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate CalVer tag
+        id: version
+        if: steps.sync.outputs.new_commits == 'true' || inputs.force_release
+        run: |
+          BASE_TAG="v$(date -u +'%Y.%m.%d')"
+          SUFFIX=0
+          TAG="$BASE_TAG"
+          git fetch --tags
+          while git rev-parse "$TAG" >/dev/null 2>&1; do
+            SUFFIX=$((SUFFIX + 1))
+            TAG="${BASE_TAG}.${SUFFIX}"
+          done
+          echo "Generated tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: sync
+    if: needs.sync.outputs.new_commits == 'true' || inputs.force_release
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ needs.sync.outputs.release_tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LAST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            echo "Generating notes since $LAST_TAG"
+            COMMITS=$(gh api repos/${{ github.repository }}/compare/${LAST_TAG}...main \
+              --jq '.commits | map(select(.commit.message | startswith("feat: add automated") | not)) | map("- " + (.commit.message | split("\n")[0]) + " (" + .sha[0:7] + ")") | join("\n")' \
+              2>/dev/null || echo "")
+            if [ -z "$COMMITS" ]; then
+              COMMITS=$(git log --pretty=format:"- %s (%h)" -5 -- ':!.github/workflows/sync-and-release.yml')
+            fi
+          else
+            echo "No previous release found, using recent commits"
+            COMMITS=$(git log --pretty=format:"- %s (%h)" -10 -- ':!.github/workflows/sync-and-release.yml')
+          fi
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "Synced from upstream [Mygod/slipstream-rust](https://github.com/Mygod/slipstream-rust)"
+            echo ""
+            echo "### Commits"
+            echo "$COMMITS"
+            echo ""
+            echo "---"
+            echo "*This is an automated release from the upstream repository.*"
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.sync.outputs.release_tag }}" \
+            --title "${{ needs.sync.outputs.release_tag }}" \
+            --notes-file release_notes.md \
+            --target main
+
+  build:
+    needs: [sync, release]
+    if: needs.sync.outputs.new_commits == 'true' || inputs.force_release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: linux-arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev python3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build picoquic
+        run: ./scripts/build_picoquic.sh
+
+      - name: Build release binaries
+        run: cargo build --release -p slipstream-client -p slipstream-server
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp target/release/slipstream-client artifacts/slipstream-client-${{ matrix.artifact_name }}
+          cp target/release/slipstream-server artifacts/slipstream-server-${{ matrix.artifact_name }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.artifact_name }}
+          path: artifacts/
+
+  upload-assets:
+    needs: [sync, release, build]
+    if: needs.sync.outputs.new_commits == 'true' || inputs.force_release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum slipstream-* > SHA256SUMS
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.sync.outputs.release_tag }}" \
+            artifacts/* \
+            --repo ${{ github.repository }}
+
+      - name: Update latest release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Delete existing 'latest' release if it exists
+          gh release delete latest --yes --repo ${{ github.repository }} 2>/dev/null || true
+
+          # Delete the 'latest' tag if it exists
+          git push origin :refs/tags/latest 2>/dev/null || true
+
+          # Create new 'latest' release with same assets
+          gh release create latest \
+            --title "Latest Release" \
+            --notes "This release always points to the most recent build. Version: ${{ needs.sync.outputs.release_tag }}" \
+            --target main \
+            --repo ${{ github.repository }}
+
+          # Upload artifacts to latest release
+          gh release upload latest \
+            artifacts/* \
+            --repo ${{ github.repository }} \
+            --clobber
