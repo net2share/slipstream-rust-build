@@ -27,6 +27,7 @@ static INVARIANT_REPORTER: InvariantReporter = InvariantReporter::new(1_000_000)
 pub(crate) struct ClientState {
     ready: bool,
     closing: bool,
+    connection_generation: usize,
     streams: HashMap<u64, ClientStream>,
     multi_stream_mode: bool,
     command_tx: mpsc::UnboundedSender<Command>,
@@ -438,6 +439,7 @@ impl ClientState {
         Self {
             ready: false,
             closing: false,
+            connection_generation: 0,
             streams: HashMap::new(),
             multi_stream_mode: false,
             command_tx,
@@ -557,6 +559,7 @@ impl ClientState {
         }
         self.ready = false;
         self.closing = false;
+        self.connection_generation = self.connection_generation.wrapping_add(1);
         self.multi_stream_mode = false;
         self.path_events.clear();
         self.acceptor.reset();
@@ -620,6 +623,22 @@ fn check_stream_invariants(state: &ClientState, stream_id: u64, context: &str) {
     }
 }
 
+fn command_generation_matches(
+    state: &ClientState,
+    stream_id: u64,
+    generation: usize,
+    label: &str,
+) -> bool {
+    if generation == state.connection_generation {
+        return true;
+    }
+    debug!(
+        "stream {}: ignoring stale {} generation={} current_generation={}",
+        stream_id, label, generation, state.connection_generation
+    );
+    false
+}
+
 struct ClientStream {
     write_tx: mpsc::UnboundedSender<StreamWrite>,
     read_abort_tx: Option<oneshot::Sender<()>>,
@@ -659,13 +678,16 @@ pub(crate) enum Command {
     },
     StreamReadError {
         stream_id: u64,
+        generation: usize,
     },
     StreamWriteError {
         stream_id: u64,
+        generation: usize,
     },
     StreamWriteDrained {
         stream_id: u64,
         bytes: usize,
+        generation: usize,
     },
 }
 
@@ -1071,6 +1093,7 @@ mod tests {
             Command::StreamWriteDrained {
                 stream_id,
                 bytes: 0,
+                generation: 0,
             },
         );
         assert!(
@@ -1108,6 +1131,7 @@ mod tests {
             Command::StreamWriteDrained {
                 stream_id,
                 bytes: 0,
+                generation: 0,
             },
         );
 
@@ -1160,6 +1184,45 @@ mod tests {
                 "stream state should be removed when mark_active_stream fails"
             );
         });
+    }
+
+    #[test]
+    fn stale_task_command_is_ignored_after_reconnect() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let data_notify = Arc::new(Notify::new());
+        let acceptor = acceptor::ClientAcceptor::new();
+        let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+        let stream_id = 4;
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+
+        state.streams.insert(
+            stream_id,
+            ClientStream {
+                write_tx,
+                read_abort_tx: Some(read_abort_tx),
+                data_rx: None,
+                tx_bytes: 0,
+                recv_state: StreamRecvState::Open,
+                send_state: StreamSendState::Open,
+                flow: FlowControlState::default(),
+            },
+        );
+        state.connection_generation = 1;
+
+        handle_command(
+            std::ptr::null_mut(),
+            &mut state as *mut _,
+            Command::StreamReadError {
+                stream_id,
+                generation: 0,
+            },
+        );
+
+        assert!(
+            state.streams.contains_key(&stream_id),
+            "stale task command from old generation must not mutate current stream state"
+        );
     }
 
     #[test]
@@ -1310,6 +1373,7 @@ pub(crate) fn handle_command(
             let (write_tx, write_rx) = mpsc::unbounded_channel();
             let command_tx = state.command_tx.clone();
             let (read_abort_tx, read_abort_rx) = oneshot::channel();
+            let generation = state.connection_generation;
             state.streams.insert(
                 stream_id,
                 ClientStream {
@@ -1326,6 +1390,7 @@ pub(crate) fn handle_command(
                 stream_id,
                 read_half,
                 read_abort_rx,
+                generation,
                 command_tx.clone(),
                 data_tx,
                 data_notify,
@@ -1334,6 +1399,7 @@ pub(crate) fn handle_command(
                 stream_id,
                 write_half,
                 write_rx,
+                generation,
                 command_tx,
                 send_buffer_bytes,
             );
@@ -1429,7 +1495,13 @@ pub(crate) fn handle_command(
             }
             check_stream_invariants(state, stream_id, "StreamClosed");
         }
-        Command::StreamReadError { stream_id } => {
+        Command::StreamReadError {
+            stream_id,
+            generation,
+        } => {
+            if !command_generation_matches(state, stream_id, generation, "StreamReadError") {
+                return;
+            }
             if let Some(stream) = state.streams.remove(&stream_id) {
                 warn!(
                     "stream {}: tcp read error rx_bytes={} tx_bytes={} queued={} consumed_offset={} fin_offset={:?}",
@@ -1445,7 +1517,13 @@ pub(crate) fn handle_command(
             }
             unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
         }
-        Command::StreamWriteError { stream_id } => {
+        Command::StreamWriteError {
+            stream_id,
+            generation,
+        } => {
+            if !command_generation_matches(state, stream_id, generation, "StreamWriteError") {
+                return;
+            }
             if let Some(stream) = state.streams.remove(&stream_id) {
                 warn!(
                     "stream {}: tcp write error rx_bytes={} tx_bytes={} queued={} consumed_offset={} fin_offset={:?}",
@@ -1461,7 +1539,14 @@ pub(crate) fn handle_command(
             }
             unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
         }
-        Command::StreamWriteDrained { stream_id, bytes } => {
+        Command::StreamWriteDrained {
+            stream_id,
+            bytes,
+            generation,
+        } => {
+            if !command_generation_matches(state, stream_id, generation, "StreamWriteDrained") {
+                return;
+            }
             let mut remove_stream = false;
             if let Some(stream) = state.streams.get_mut(&stream_id) {
                 if stream.flow.discarding {
@@ -1512,6 +1597,7 @@ fn spawn_client_reader(
     stream_id: u64,
     mut read_half: tokio::net::tcp::OwnedReadHalf,
     mut read_abort_rx: oneshot::Receiver<()>,
+    generation: usize,
     command_tx: mpsc::UnboundedSender<Command>,
     data_tx: mpsc::Sender<Vec<u8>>,
     data_notify: Arc<Notify>,
@@ -1539,7 +1625,10 @@ fn spawn_client_reader(
                             continue;
                         }
                         Err(_) => {
-                            let _ = command_tx.send(Command::StreamReadError { stream_id });
+                            let _ = command_tx.send(Command::StreamReadError {
+                                stream_id,
+                                generation,
+                            });
                             break;
                         }
                     }
@@ -1555,6 +1644,7 @@ fn spawn_client_writer(
     stream_id: u64,
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     mut write_rx: mpsc::UnboundedReceiver<StreamWrite>,
+    generation: usize,
     command_tx: mpsc::UnboundedSender<Command>,
     coalesce_max_bytes: usize,
 ) {
@@ -1586,12 +1676,16 @@ fn spawn_client_writer(
                     }
                     let len = buffer.len();
                     if write_half.write_all(&buffer).await.is_err() {
-                        let _ = command_tx.send(Command::StreamWriteError { stream_id });
+                        let _ = command_tx.send(Command::StreamWriteError {
+                            stream_id,
+                            generation,
+                        });
                         return;
                     }
                     let _ = command_tx.send(Command::StreamWriteDrained {
                         stream_id,
                         bytes: len,
+                        generation,
                     });
                     if saw_fin {
                         let _ = write_half.shutdown().await;
