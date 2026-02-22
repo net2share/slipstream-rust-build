@@ -142,23 +142,14 @@ impl AcceptorLimiter {
         if generation != self.generation.load(Ordering::SeqCst) {
             return;
         }
-        loop {
-            let used = self.used.load(Ordering::SeqCst);
-            if used == 0 {
-                return;
-            }
-            if self
-                .used
-                .compare_exchange(used, used - 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                self.notify.notify_one();
-                return;
-            }
-        }
+        self.decrement_used_and_notify();
     }
 
     fn rollback_used(&self) {
+        self.decrement_used_and_notify();
+    }
+
+    fn decrement_used_and_notify(&self) {
         loop {
             let used = self.used.load(Ordering::SeqCst);
             if used == 0 {

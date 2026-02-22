@@ -15,6 +15,22 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+fn mark_stream_active(cnx_id: usize, stream_id: u64, forced_failure: bool) -> i32 {
+    let cnx = cnx_id as *mut picoquic_cnx_t;
+    #[cfg(test)]
+    if forced_failure {
+        return test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR;
+    }
+    #[cfg(not(test))]
+    let _ = forced_failure;
+    #[cfg(test)]
+    assert!(
+        cnx_id >= 0x1000,
+        "mark_active_stream called with synthetic cnx_id; set test failure counter"
+    );
+    unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) }
+}
+
 pub(crate) fn drain_commands(
     state_ptr: *mut ServerState,
     command_rx: &mut mpsc::UnboundedReceiver<Command>,
@@ -135,19 +151,7 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                     pending.store(true, Ordering::SeqCst);
                 }
                 let cnx = cnx_id as *mut picoquic_cnx_t;
-                #[cfg(test)]
-                let ret = if forced_failure {
-                    test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR
-                } else {
-                    assert!(
-                        cnx_id >= 0x1000,
-                        "mark_active_stream called with synthetic cnx_id; set test failure counter"
-                    );
-                    unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) }
-                };
-                #[cfg(not(test))]
-                let ret =
-                    unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
+                let ret = mark_stream_active(cnx_id, stream_id, forced_failure);
                 if ret != 0 {
                     const MARK_ACTIVE_FAIL_LOG_INTERVAL_US: u64 = 1_000_000;
                     let now = unsafe { picoquic_current_time() };
@@ -205,19 +209,7 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
             #[cfg(not(test))]
             let forced_failure = false;
             let cnx = cnx_id as *mut picoquic_cnx_t;
-            #[cfg(test)]
-            let ret = if forced_failure {
-                test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR
-            } else {
-                assert!(
-                    cnx_id >= 0x1000,
-                    "mark_active_stream called with synthetic cnx_id; set test failure counter"
-                );
-                unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) }
-            };
-            #[cfg(not(test))]
-            let ret =
-                unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
+            let ret = mark_stream_active(cnx_id, stream_id, forced_failure);
             if ret != 0 {
                 if let Some(stream) = shutdown_stream(state, key) {
                     warn!(
