@@ -426,7 +426,6 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -434,6 +433,10 @@ name = "slipstream-core"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "socket2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -442,8 +445,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "slipstream-core",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -469,7 +472,6 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

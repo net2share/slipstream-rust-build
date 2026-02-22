@@ -1,7 +1,8 @@
 use crate::config::{ensure_cert_key, load_or_create_reset_seed, ResetSeed};
 use crate::udp_fallback::{handle_packet, FallbackManager, PacketContext, MAX_UDP_PACKET_SIZE};
 use slipstream_core::{
-    net::is_transient_udp_error, normalize_dual_stack_addr, resolve_host_port, HostPort,
+    net::{bind_first_resolved, bind_udp_socket_addr, is_transient_udp_error},
+    normalize_dual_stack_addr, resolve_host_port, HostPort,
 };
 use slipstream_dns::{encode_response, Question, Rcode, ResponseParams};
 use slipstream_ffi::picoquic::{
@@ -13,7 +14,6 @@ use slipstream_ffi::picoquic::{
 use slipstream_ffi::{
     configure_quic_with_custom, socket_addr_to_storage, take_crypto_errors, QuicGuard,
 };
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::{lookup_host, UdpSocket as TokioUdpSocket};
+use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -480,45 +480,14 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
 }
 
 async fn bind_udp_socket(host: &str, port: u16) -> Result<TokioUdpSocket, ServerError> {
-    let addrs: Vec<SocketAddr> = lookup_host((host, port)).await.map_err(map_io)?.collect();
-    if addrs.is_empty() {
-        return Err(ServerError::new(format!(
-            "No addresses resolved for {}:{}",
-            host, port
-        )));
-    }
-    let mut last_err = None;
-    for addr in addrs {
-        match bind_udp_socket_addr(addr) {
-            Ok(socket) => return Ok(socket),
-            Err(err) => last_err = Some(err),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        ServerError::new(format!("Failed to bind UDP socket on {}:{}", host, port))
-    }))
-}
-
-fn bind_udp_socket_addr(addr: SocketAddr) -> Result<TokioUdpSocket, ServerError> {
-    let domain = match addr {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(map_io)?;
-    if let SocketAddr::V6(_) = addr {
-        if let Err(err) = socket.set_only_v6(false) {
-            tracing::warn!(
-                "Failed to enable dual-stack UDP listener on {}: {}",
-                addr,
-                err
-            );
-        }
-    }
-    let sock_addr = SockAddr::from(addr);
-    socket.bind(&sock_addr).map_err(map_io)?;
-    socket.set_nonblocking(true).map_err(map_io)?;
-    let std_socket: std::net::UdpSocket = socket.into();
-    TokioUdpSocket::from_std(std_socket).map_err(map_io)
+    bind_first_resolved(
+        host,
+        port,
+        |addr| bind_udp_socket_addr(addr, "UDP listener"),
+        "UDP socket",
+    )
+    .await
+    .map_err(map_io)
 }
 
 pub(crate) fn map_io(err: std::io::Error) -> ServerError {

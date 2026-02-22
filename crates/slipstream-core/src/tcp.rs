@@ -64,28 +64,16 @@ pub fn within_stream_buffer(queued_bytes: usize, incoming_len: usize) -> bool {
 
 #[cfg(unix)]
 pub fn tcp_recv_buffer_bytes<T: AsRawFd>(stream: &T) -> Option<usize> {
-    use std::mem::size_of;
-
-    let mut value: libc::c_int = 0;
-    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &mut value as *mut _ as *mut _,
-            &mut len as *mut _,
-        )
-    };
-    if ret == 0 && value > 0 {
-        Some(value as usize)
-    } else {
-        None
-    }
+    tcp_socket_opt_bytes(stream, libc::SO_RCVBUF)
 }
 
 #[cfg(unix)]
 pub fn tcp_send_buffer_bytes<T: AsRawFd>(stream: &T) -> Option<usize> {
+    tcp_socket_opt_bytes(stream, libc::SO_SNDBUF)
+}
+
+#[cfg(unix)]
+fn tcp_socket_opt_bytes<T: AsRawFd>(stream: &T, optname: libc::c_int) -> Option<usize> {
     use std::mem::size_of;
 
     let mut value: libc::c_int = 0;
@@ -94,7 +82,7 @@ pub fn tcp_send_buffer_bytes<T: AsRawFd>(stream: &T) -> Option<usize> {
         libc::getsockopt(
             stream.as_raw_fd(),
             libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
+            optname,
             &mut value as *mut _ as *mut _,
             &mut len as *mut _,
         )

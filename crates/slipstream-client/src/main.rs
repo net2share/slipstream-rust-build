@@ -7,11 +7,11 @@ mod streams;
 
 use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser};
 use slipstream_core::{
+    cli::{exit_with_error, exit_with_message, init_logging, unwrap_or_exit},
     normalize_domain, parse_host_port, parse_host_port_parts, sip003, AddressKind, HostPort,
 };
 use slipstream_ffi::{ClientConfig, ResolverMode, ResolverSpec};
 use tokio::runtime::Builder;
-use tracing_subscriber::EnvFilter;
 
 use runtime::run_client;
 
@@ -64,85 +64,77 @@ fn main() {
     init_logging();
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
-    let sip003_env = sip003::read_sip003_env().unwrap_or_else(|err| {
-        tracing::error!("SIP003 env error: {}", err);
-        std::process::exit(2);
-    });
+    let sip003_env = unwrap_or_exit(sip003::read_sip003_env(), "SIP003 env error", 2);
     if sip003_env.is_present() {
         tracing::info!("SIP003 env detected; applying SS_* overrides with CLI precedence");
     }
 
     let tcp_listen_host_provided = cli_provided(&matches, "tcp_listen_host");
     let tcp_listen_port_provided = cli_provided(&matches, "tcp_listen_port");
-    let (tcp_listen_host, tcp_listen_port) = sip003::select_host_port(
-        &args.tcp_listen_host,
-        args.tcp_listen_port,
-        tcp_listen_host_provided,
-        tcp_listen_port_provided,
-        sip003_env.local_host.as_deref(),
-        sip003_env.local_port.as_deref(),
-        "SS_LOCAL",
-    )
-    .unwrap_or_else(|err| {
-        tracing::error!("SIP003 env error: {}", err);
-        std::process::exit(2);
-    });
+    let (tcp_listen_host, tcp_listen_port) = unwrap_or_exit(
+        sip003::select_host_port(
+            &args.tcp_listen_host,
+            args.tcp_listen_port,
+            tcp_listen_host_provided,
+            tcp_listen_port_provided,
+            sip003_env.local_host.as_deref(),
+            sip003_env.local_port.as_deref(),
+            "SS_LOCAL",
+        ),
+        "SIP003 env error",
+        2,
+    );
 
     let domain = if let Some(domain) = args.domain.clone() {
         domain
     } else {
-        let option_domain = parse_domain_option(&sip003_env.plugin_options).unwrap_or_else(|err| {
-            tracing::error!("SIP003 env error: {}", err);
-            std::process::exit(2);
-        });
+        let option_domain = unwrap_or_exit(
+            parse_domain_option(&sip003_env.plugin_options),
+            "SIP003 env error",
+            2,
+        );
         if let Some(domain) = option_domain {
             domain
         } else {
-            tracing::error!("A domain is required");
-            std::process::exit(2);
+            exit_with_message("A domain is required", 2);
         }
     };
 
     let cli_has_resolvers = has_cli_resolvers(&matches);
     let resolvers = if cli_has_resolvers {
-        build_resolvers(&matches, true).unwrap_or_else(|err| {
-            tracing::error!("Resolver error: {}", err);
-            std::process::exit(2);
-        })
+        unwrap_or_exit(build_resolvers(&matches, true), "Resolver error", 2)
     } else {
-        let resolver_options = parse_resolvers_from_options(&sip003_env.plugin_options)
-            .unwrap_or_else(|err| {
-                tracing::error!("SIP003 env error: {}", err);
-                std::process::exit(2);
-            });
+        let resolver_options = unwrap_or_exit(
+            parse_resolvers_from_options(&sip003_env.plugin_options),
+            "SIP003 env error",
+            2,
+        );
         if !resolver_options.resolvers.is_empty() {
             resolver_options.resolvers
         } else {
-            let sip003_remote = sip003::parse_endpoint(
-                sip003_env.remote_host.as_deref(),
-                sip003_env.remote_port.as_deref(),
-                "SS_REMOTE",
-            )
-            .unwrap_or_else(|err| {
-                tracing::error!("SIP003 env error: {}", err);
-                std::process::exit(2);
-            });
+            let sip003_remote = unwrap_or_exit(
+                sip003::parse_endpoint(
+                    sip003_env.remote_host.as_deref(),
+                    sip003_env.remote_port.as_deref(),
+                    "SS_REMOTE",
+                ),
+                "SIP003 env error",
+                2,
+            );
             if let Some(endpoint) = &sip003_remote {
                 let mode = if resolver_options.authoritative_remote {
                     ResolverMode::Authoritative
                 } else {
                     ResolverMode::Recursive
                 };
-                let resolver =
-                    parse_host_port_parts(&endpoint.host, endpoint.port, AddressKind::Resolver)
-                        .unwrap_or_else(|err| {
-                            tracing::error!("SIP003 env error: {}", err);
-                            std::process::exit(2);
-                        });
+                let resolver = unwrap_or_exit(
+                    parse_host_port_parts(&endpoint.host, endpoint.port, AddressKind::Resolver),
+                    "SIP003 env error",
+                    2,
+                );
                 vec![ResolverSpec { resolver, mode }]
             } else {
-                tracing::error!("At least one resolver is required");
-                std::process::exit(2);
+                exit_with_message("At least one resolver is required", 2);
             }
         }
     };
@@ -150,10 +142,11 @@ fn main() {
     let congestion_control = if args.congestion_control.is_some() {
         args.congestion_control.clone()
     } else {
-        parse_congestion_control(&sip003_env.plugin_options).unwrap_or_else(|err| {
-            tracing::error!("SIP003 env error: {}", err);
-            std::process::exit(2);
-        })
+        unwrap_or_exit(
+            parse_congestion_control(&sip003_env.plugin_options),
+            "SIP003 env error",
+            2,
+        )
     };
 
     let cert = if args.cert.is_some() {
@@ -170,11 +163,11 @@ fn main() {
     let keep_alive_interval = if cli_provided(&matches, "keep_alive_interval") {
         args.keep_alive_interval
     } else {
-        let keep_alive_override = parse_keep_alive_interval(&sip003_env.plugin_options)
-            .unwrap_or_else(|err| {
-                tracing::error!("SIP003 env error: {}", err);
-                std::process::exit(2);
-            });
+        let keep_alive_override = unwrap_or_exit(
+            parse_keep_alive_interval(&sip003_env.plugin_options),
+            "SIP003 env error",
+            2,
+        );
         keep_alive_override.unwrap_or(args.keep_alive_interval)
     };
 
@@ -198,20 +191,8 @@ fn main() {
         .expect("Failed to build Tokio runtime");
     match runtime.block_on(run_client(&config)) {
         Ok(code) => std::process::exit(code),
-        Err(err) => {
-            tracing::error!("Client error: {}", err);
-            std::process::exit(1);
-        }
+        Err(err) => exit_with_error("Client error", err, 1),
     }
-}
-
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
-        .try_init();
 }
 
 fn parse_domain(input: &str) -> Result<String, String> {

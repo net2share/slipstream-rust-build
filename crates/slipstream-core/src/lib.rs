@@ -1,5 +1,6 @@
 use std::fmt;
 
+pub mod cli;
 pub mod flow_control;
 pub mod invariants;
 mod macros;

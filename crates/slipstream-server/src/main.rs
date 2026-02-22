@@ -7,10 +7,10 @@ mod udp_fallback;
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser};
 use server::{run_server, ServerConfig};
 use slipstream_core::{
+    cli::{exit_with_error, exit_with_message, init_logging, unwrap_or_exit},
     normalize_domain, parse_host_port, parse_host_port_parts, sip003, AddressKind, HostPort,
 };
 use tokio::runtime::Builder;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,49 +53,45 @@ fn main() {
     init_logging();
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
-    let sip003_env = sip003::read_sip003_env().unwrap_or_else(|err| {
-        tracing::error!("SIP003 env error: {}", err);
-        std::process::exit(2);
-    });
+    let sip003_env = unwrap_or_exit(sip003::read_sip003_env(), "SIP003 env error", 2);
     if sip003_env.is_present() {
         tracing::info!("SIP003 env detected; applying SS_* overrides with CLI precedence");
     }
 
     let dns_listen_host_provided = cli_provided(&matches, "dns_listen_host");
     let dns_listen_port_provided = cli_provided(&matches, "dns_listen_port");
-    let (dns_listen_host, dns_listen_port) = sip003::select_host_port(
-        &args.dns_listen_host,
-        args.dns_listen_port,
-        dns_listen_host_provided,
-        dns_listen_port_provided,
-        sip003_env.remote_host.as_deref(),
-        sip003_env.remote_port.as_deref(),
-        "SS_REMOTE",
-    )
-    .unwrap_or_else(|err| {
-        tracing::error!("SIP003 env error: {}", err);
-        std::process::exit(2);
-    });
+    let (dns_listen_host, dns_listen_port) = unwrap_or_exit(
+        sip003::select_host_port(
+            &args.dns_listen_host,
+            args.dns_listen_port,
+            dns_listen_host_provided,
+            dns_listen_port_provided,
+            sip003_env.remote_host.as_deref(),
+            sip003_env.remote_port.as_deref(),
+            "SS_REMOTE",
+        ),
+        "SIP003 env error",
+        2,
+    );
 
     let sip003_local = if cli_provided(&matches, "target_address") {
         None
     } else {
-        sip003::parse_endpoint(
-            sip003_env.local_host.as_deref(),
-            sip003_env.local_port.as_deref(),
-            "SS_LOCAL",
+        unwrap_or_exit(
+            sip003::parse_endpoint(
+                sip003_env.local_host.as_deref(),
+                sip003_env.local_port.as_deref(),
+                "SS_LOCAL",
+            ),
+            "SIP003 env error",
+            2,
         )
-        .unwrap_or_else(|err| {
-            tracing::error!("SIP003 env error: {}", err);
-            std::process::exit(2);
-        })
     };
     let target_address = if let Some(endpoint) = &sip003_local {
-        parse_host_port_parts(&endpoint.host, endpoint.port, AddressKind::Target).unwrap_or_else(
-            |err| {
-                tracing::error!("SIP003 env error: {}", err);
-                std::process::exit(2);
-            },
+        unwrap_or_exit(
+            parse_host_port_parts(&endpoint.host, endpoint.port, AddressKind::Target),
+            "SIP003 env error",
+            2,
         )
     } else {
         args.target_address.clone()
@@ -103,25 +99,20 @@ fn main() {
     let fallback_address = if cli_provided(&matches, "fallback") {
         args.fallback.clone()
     } else {
-        sip003::last_option_value(&sip003_env.plugin_options, "fallback").map(|value| {
-            parse_fallback_address(&value).unwrap_or_else(|err| {
-                tracing::error!("SIP003 env error: {}", err);
-                std::process::exit(2);
-            })
-        })
+        sip003::last_option_value(&sip003_env.plugin_options, "fallback")
+            .map(|value| unwrap_or_exit(parse_fallback_address(&value), "SIP003 env error", 2))
     };
 
     let domains = if !args.domains.is_empty() {
         args.domains.clone()
     } else {
-        let option_domains =
-            parse_domains_from_options(&sip003_env.plugin_options).unwrap_or_else(|err| {
-                tracing::error!("SIP003 env error: {}", err);
-                std::process::exit(2);
-            });
+        let option_domains = unwrap_or_exit(
+            parse_domains_from_options(&sip003_env.plugin_options),
+            "SIP003 env error",
+            2,
+        );
         if option_domains.is_empty() {
-            tracing::error!("At least one domain is required");
-            std::process::exit(2);
+            exit_with_message("At least one domain is required", 2);
         }
         option_domains
     };
@@ -131,8 +122,7 @@ fn main() {
     } else if let Some(cert) = sip003::last_option_value(&sip003_env.plugin_options, "cert") {
         cert
     } else {
-        tracing::error!("A certificate path is required");
-        std::process::exit(2);
+        exit_with_message("A certificate path is required", 2);
     };
 
     let key = if let Some(key) = args.key.clone() {
@@ -140,8 +130,7 @@ fn main() {
     } else if let Some(key) = sip003::last_option_value(&sip003_env.plugin_options, "key") {
         key
     } else {
-        tracing::error!("A key path is required");
-        std::process::exit(2);
+        exit_with_message("A key path is required", 2);
     };
     let reset_seed_path = if let Some(path) = args.reset_seed.clone() {
         Some(path)
@@ -153,10 +142,7 @@ fn main() {
     } else if let Some(value) =
         sip003::last_option_value(&sip003_env.plugin_options, "max-connections")
     {
-        parse_max_connections(&value).unwrap_or_else(|err| {
-            tracing::error!("SIP003 env error: {}", err);
-            std::process::exit(2);
-        })
+        unwrap_or_exit(parse_max_connections(&value), "SIP003 env error", 2)
     } else {
         args.max_connections
     };
@@ -183,20 +169,8 @@ fn main() {
         .expect("Failed to build Tokio runtime");
     match runtime.block_on(run_server(&config)) {
         Ok(code) => std::process::exit(code),
-        Err(err) => {
-            tracing::error!("Server error: {}", err);
-            std::process::exit(1);
-        }
+        Err(err) => exit_with_error("Server error", err, 1),
     }
-}
-
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
-        .try_init();
 }
 
 fn parse_domain(input: &str) -> Result<String, String> {

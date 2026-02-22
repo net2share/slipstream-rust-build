@@ -1,3 +1,4 @@
+use slipstream_core::cli::init_logging;
 use slipstream_dns::{
     build_qname, decode_query, decode_response, encode_query, encode_response,
     max_payload_len_for_domain, QueryParams, Question, ResponseParams, CLASS_IN, RR_TXT,
@@ -5,7 +6,6 @@ use slipstream_dns::{
 use std::env;
 use std::time::Instant;
 use tracing::{error, warn};
-use tracing_subscriber::EnvFilter;
 
 fn main() {
     init_logging();
@@ -122,13 +122,4 @@ fn bench(label: &str, iterations: usize, bytes_per_iter: usize, mut f: impl FnMu
 
 fn print_usage() {
     println!("Usage: bench_dns [--iterations=N] [--payload-len=N] [--domain=NAME]");
-}
-
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
-        .try_init();
 }
